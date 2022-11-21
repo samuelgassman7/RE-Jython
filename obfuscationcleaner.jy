@@ -1,7 +1,7 @@
 ######
 ###
 ### execute this script in a jython interpreter:
-### exec(open(r"C:/Users/thesa/Desktop/ghidrascripts/obfuscationcleaner.jy").read())
+### exec(open(r"C:/Users/thesa/Desktop/RE-Jython/obfuscationcleaner.jy").read())
 ###
 ######
 
@@ -210,7 +210,11 @@ def getWordSize():
 
 def getParamCountFromPush(callerName, calledFunc):
     ###ASM for calling function stored in arraylist
-    sampleCaller = getFunction(callerName)
+    try:
+        sampleCaller = getFunction(callerName)
+    except java.lang.AssertionError:
+        return -1 
+
     it = listing.getInstructions(sampleCaller.body, True)
     callerInst = java.util.ArrayList()
 
@@ -377,6 +381,10 @@ def cleanCallingConvention(funcName):
 ###     user can confirm our results.
 
 def restore(func):
+    ###ghidra gets angry if you try to replace 0 params with another 0 params
+    if(len(func.getParameters()) == 0):
+        return
+
     func.replaceParameters(paramlists[func.name], FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.DEFAULT)
 
 
@@ -412,8 +420,9 @@ def cleanDecompilation(function):
                 ###it guarantees an index out of bound exception
                 break
     for i in range(len(bodyLines)-1,-1,-1):
-        if(re.search("in_FS_OFFSET + 0x28", bodyLines[i]) != None):
+        if(re.search(r"in_FS_OFFSET \+ 0x28", bodyLines[i]) != None or re.search("__stack_chk_guard", bodyLines[i]) != None):
             bodyLines = bodyLines[0:i] + bodyLines[i+1:]
+
 
     decomplists[function.name] = bodyLines
 
@@ -454,6 +463,24 @@ def checkPaths():
     return True
 
 
+###def findUserDefinedFuncs():
+###     populate the global set of functions (that a user
+###          wrote into their code)
+###     by doing a depth first search on the graph of called
+###     functions. This should technically start with the
+###     entry point (main method) to get best results.
+###
+###@param func: main method (or root of your search tree)
+###@output functionlist: populates this list with the DFS tree.
+def findUserDefinedFuncs(func):
+    global functionlist
+
+    for x in func.getCalledFunctions(ConsoleTaskMonitor()):
+        if(x not in functionlist and not(x.isThunk() or x.getCallFixup() != None or x.isExternal() or x.isDeleted())):
+            if(len(getGlobalFunctions(x.name)) != 0):
+                functionlist.add(x)
+                findUserDefinedFuncs(x)
+
 ###def main():
 ###     1. make sure an output path exists
 ###     2. find the real entry point function
@@ -469,13 +496,14 @@ def main():
         return
     print "*************Cleaning*************"
     mainFunc = findEntry()
-    for x in mainFunc.getCalledFunctions(ConsoleTaskMonitor()):
-        if(not (x.isThunk() or x.getCallFixup() != None or x.isExternal())):
-            print("========\nexecuting clean on " + x.name)
-            ###first, fix param lists
-            cleanCallingConvention(x.name)
-            ###then fix decompilation
-            cleanDecompilation(x)
+
+    findUserDefinedFuncs(mainFunc)
+    for x in functionlist:
+        print("========\nexecuting clean on " + x.name)
+        ###first, fix param lists
+        cleanCallingConvention(x.name)
+        ###then fix decompilation
+        cleanDecompilation(x)
 
     print("========\nexecuting clean on Main Method: " + mainFunc.name)
     cleanDecompilation(mainFunc)
@@ -484,12 +512,12 @@ def main():
 
     print "*************Restoring*************"
     print "Restoring Original Code:"
-    for x in mainFunc.getCalledFunctions(ConsoleTaskMonitor()):
-        if(not (x.isThunk() or x.getCallFixup() != None or x.isExternal())):
-            print("========\nrestoring " + x.name)
-            saveDecompilation(x, False)
-            restore(x)
+    for x in functionlist:
+        print("========\nrestoring " + x.name)
+        saveDecompilation(x, False)
 
+    for x in functionlist:
+        restore(x)
     
     print("========\nrestoring " + mainFunc.name)
     saveDecompilation(mainFunc, True)
@@ -504,4 +532,5 @@ cp = state.currentProgram
 listing=cp.listing
 paramlists = dict()
 decomplists = dict()
+functionlist = set()
 main()
