@@ -1,0 +1,507 @@
+######
+###
+### execute this script in a jython interpreter:
+### exec(open(r"C:/Users/thesa/Desktop/ghidrascripts/obfuscationcleaner.jy").read())
+###
+######
+
+###General Python Module Imports
+import re
+import getpass
+import os.path
+
+
+###Jython module imports to connect with Ghidra
+from ghidra.app.decompiler import DecompInterface
+from ghidra.util.task import ConsoleTaskMonitor
+from ghidra.program.model.listing.Function import FunctionUpdateType
+from ghidra.program.model.symbol import SourceType
+
+
+
+##Make sure your path ends with a "/"
+WINPATH = r"C:/Users/INSERTUSERNAME/Desktop/"
+UNIXPATH = r"/home/INSERTUSERNAME/"
+PATH = ""
+
+###when running the calling convention cleaning code 
+###     (cleanCallingConvention)
+###there are two options, run strictly, where the number of
+###push instructions must equal the number of positive stack
+###offset variables (expected parameters) which
+###must equal the number of unwritten variables
+###OR
+###run non-strictly, and rely only on push count and the number
+###of positive stack offset variables.
+RUNSTRICT = False
+
+
+###def doDecompile():
+###     collect the lines of code for a specific function
+###     and return them as a list
+###
+###@param function: a function reference to get the body of 
+###@return a Python List() of the lines of code
+
+def doDecompile(function):
+    results = ifc.decompileFunction(function, 0, ConsoleTaskMonitor())
+    body = results.getDecompiledFunction().getC()
+
+    body = body.replace("\r","")
+    return body.split("\n")
+
+
+###def doDecompileAndSave():
+###     collect the lines of code for a specific function
+###     and write them to a file. If the function is identified
+###     by a calling function as a main method, designate it as
+###     such with the filename of the output
+###
+###@param function: a function reference to get the body of and
+###     and write to a file
+###@output a file containing the decompiled results. The filename
+###     is of the form <PATH VARIABLE>/<THIS EXECUTABLE's NAME>/
+###                         /<IS MAIN METHOD>/<FUNCTION NAME>.c 
+
+def saveDecompilation(function, isMain):
+    if(not decomplists.has_key(function.name)):
+        raise java.lang.AssertionError("attempting to save decompilation for a function that has not gone through cleanDecompilation()")
+    body = ""
+    for x in decomplists[function.name]:
+        body+= x + "\n"
+
+    if(isMain):
+        print("writing Entry Point (Main method) " + function.name + " to file")
+        with open(PATH+getCurrentProgram().name + "_MAINMETHOD-" + function.name + ".c", "w") as file:
+            file.write(body)
+            return
+
+    print("writing method " + function.name + " to file")
+    with open(PATH+getCurrentProgram().name + "_" + function.name + ".c", "w") as file:
+        file.write(body)
+
+
+
+### def findEntry():
+###     this function finds what we call the "true" entry point
+###     of an executable (aka, where the main method really is
+###            inside of all the wrapper code that gets compiled
+###            around an executable)
+###
+###@return a reference to the suspected main function (note
+###         that often it will not be called "main")
+
+def findEntry():
+
+    ### get the entry point function (either main, _main or entry)
+    function = None
+
+    entryList = getGlobalFunctions("main")
+    if(len(entryList) != 0):
+        function = entryList[0]
+        return function
+
+    entryList = getGlobalFunctions("_main")
+    if(len(entryList) != 0):
+        function = entryList[0]
+        return function
+
+    ###an "entry" function must exist. Otherwise, fail out.
+    functionlist = getGlobalFunctions("entry")
+    if(len(functionlist) == 0):
+        raise java.lang.AssertionError("No reasonable entry point function found. Use of this script is not recommended.")
+    function = functionlist[0]
+
+    lines = doDecompile(function)
+    ### lines is now a list that contains all lines of the body of the entry point
+    returnLines = list()
+    for x in lines:
+        ###must match the form "return <variable>", where
+        ###variable is the exit code of the main method.
+        ###we can then find where that exit code variable is
+        ###assigned, and that is the main method.
+        match = re.search("^.*return\s*[a-zA-Z_].*;.*$", x) 
+        if (match != None):
+            returnLines.append(match.group())
+
+    ###there should only be one non-hard coded exit variable
+    assert(len(returnLines) == 1)
+
+    register = re.search("return\s*(.*);.*$", returnLines[0])
+
+    mainline = None
+    for x in lines:
+        main = re.search(".*"+register.group(1)+"\s*=\s*(\w+).*", x)
+        if(main != None):
+            mainline = main
+
+    if(mainline != None):
+        function = getGlobalFunctions(mainline.group(1))[0]
+
+    return function
+
+
+
+
+###def getFunction():
+###     a wrapper function for getGlobalFunctions() when you
+###     already know that the function exists. Calling this
+###     function on a function that does not exist will error out.
+###
+###@param funcName: String name of a function to get if you know
+###     that the function exists. If unsure if a function exists,
+###     use getGlobalFunctions()
+###
+###@return return a reference to the function
+
+def getFunction(funcName):
+    function = getGlobalFunctions(funcName)
+    if(len(function) < 1):
+        raise java.lang.AssertionError("function " + funcName + " not present")
+
+    return function[0]
+
+
+### def getWordSize():
+###     a function for determining what the word size is for the
+###     executable. This is useful for determining the number of
+###     bytes incremented/decremented on a push/pop instruction.
+###
+###@return the number of bytes to store an address on the system
+
+def getWordSize():
+    arch = cp.getLanguageID().getIdAsString().split(":")[2]
+    wordsize=0
+    if(arch == "64"):
+        return 8
+    else:
+        return 4
+
+
+########################################
+
+##These next three functions: 
+##      "getParamCountFromPush",
+##      "getPositiveOffsetVars" 
+##      "getUnwrittenVars" 
+##are three ways of validating the same information:
+##the number of parameters that should exist
+##in a function based on the assembly and the
+##decompilation results
+##
+
+#######################################
+
+
+
+##find parameter count by searching for the number of push
+##instructions before the most recent call to the called function.
+##if the number of push instructions is less than the number of
+##parameters suggested by "getPositiveOffsetVars" or
+##"getUnwrittenVars", you can be reasonably sure that the code
+##author is trying to manually obfuscate their code in the ASM.
+
+###@param callerName: String name of the function to look through
+###     (this function should call the function you are curious ,
+###     about because it will push that functions params to the 
+###     stack)
+###
+###@return the number of parameters by counting push instructions
+
+def getParamCountFromPush(callerName, calledFunc):
+    ###ASM for calling function stored in arraylist
+    sampleCaller = getFunction(callerName)
+    it = listing.getInstructions(sampleCaller.body, True)
+    callerInst = java.util.ArrayList()
+
+    """
+    We are examining the assembly of the function that calls
+    the function we are searching for, because we want to see
+    if that calling function pushes any params to the stack.
+
+    So, we must look at all instructions between when the calling
+    function's last call instruction is (or the function start
+        if there are no previous call instructions)
+    and the call instruction to the function to find.
+
+    """
+    idx = -1
+    lastcall=-1
+    i = 0
+    tofind = "CALL 0x" + str(calledFunc.entryPoint)
+    while(it.hasNext()):
+        inst = it.next()
+        callerInst.add(inst.toString().upper())
+        if(tofind.upper() == inst.toString().upper()):
+            idx = i
+        if(idx == -1 and inst.toString().upper().startswith("CALL 0X")):
+            lastcall = i
+        i+=1
+
+    if(lastcall == -1):
+        lastcall = 0
+
+
+    numPush = 0
+    for i in range(lastcall,idx+1):
+        if("PUSH" in callerInst.get(i)):
+            numPush+=1
+     
+    return numPush
+
+
+##find parameters by looking for any variable that has a positive offset compared to the base pointer register (which is referred to by getStackOffset)
+def getPositiveOffsetVars(func):
+    stackvars = func.getLocalVariables()
+    pOffsetVars = list()
+    for x in stackvars:
+        if(x.getStackOffset() > 0):
+            pOffsetVars.append(x)
+
+    return pOffsetVars
+
+
+##find parameters by looking for variables that are read from but never written to
+def getUnwrittenVars(func):
+##use regex to find all local variables that are never assigned
+    bodyLines = doDecompile(func)
+    assignedVars = list()
+    for x in func.getLocalVariables():
+        match = None
+        foundMatch = None
+        for y in bodyLines:
+            match = re.search(x.name, y)
+            if(match != None):
+                foundMatch = match
+        ###sometimes variables that don't show up in the
+        ###decompiled results still show up in getLocalVariables()
+        ###that is a bug in ghidra, so we exclude those vars.
+        if(foundMatch == None):
+            assignedVars.append(x.name)
+
+    ###first, collect all variables that ARE assigned
+    for x in bodyLines:
+        match = re.search("\s*(\w+)\s*.?=.*", x)
+        if(match != None):
+            assignedVars.append(match.group(1))
+
+    
+    ###then, remove all of those variables that were assigned
+    ###to get just the unassigned variables.
+    unwrittenVars = list()
+    for x in func.getLocalVariables():
+        if (x.name not in assignedVars):
+            unwrittenVars.append(x)
+
+    return unwrittenVars
+
+
+
+###def getASMForFunc():
+###     collect the assembly instructions for a given function
+###     and return them as a list.
+###
+###@param function: a ghidra functionDB object via return 
+###     from "getFunction"
+###
+###@return: a java arraylist of lines of ASM
+
+def getASMForFunc(function):
+    it = listing.getInstructions(function.body, True)
+    asmList = java.util.ArrayList()
+    while(it.hasNext()):
+        inst = it.next()
+        asmList.add(inst)
+
+    return asmList
+  
+
+###def cleanCallingConvention():
+###     this function attempts to fix mistakes in ghidra's param
+###     list generation by looking through the assembly of the
+###     function, the number of unwritten variables (which are
+###                 probably parameters)
+###     and the number of variables with a positive stack offset
+###                 (aka, vars pushed before the base pointer)
+###
+###@param funcName: the function's Name, (not a function, but a
+###     string representation of the name) that you
+###     are looking to clean the parameter list of
+
+def cleanCallingConvention(funcName):
+    global paramlists
+    ###get assembly for the func to clean
+    ###ASM for called function stored in arraylist
+    calledFunc = getFunction(funcName)
+    calledInst = getASMForFunc(calledFunc)
+ 
+    ###assume that the function to clean is called by
+    ###at least one other function. If not, the function
+    ###is not one that the user wrote, because even main
+    ###functions are called by the entry point
+    callers = calledFunc.getCallingFunctions(ConsoleTaskMonitor())
+    if(len(callers) < 1):
+        raise java.lang.AssertionError("function " + funcName + " is not called by any other functions. Cannot have parameters")
+
+    numPush = getParamCountFromPush(callers.toArray()[0].name, calledFunc)
+    paramlist1 = getPositiveOffsetVars(calledFunc)
+    if(RUNSTRICT):
+        paramlist2 = getUnwrittenVars(calledFunc)
+    else:
+        paramlist2 = paramlist1
+
+    
+    if(paramlist1 != paramlist2 or len(paramlist1) != numPush):
+        missingVariables = list(set(paramlist1).symmetric_difference(set(paramlist2)))
+        if(len(missingVariables) == 0):
+            print "Manual inspection recommended in " + calledFunc.name + " mismatch between push instructions and expected parameters"
+        else:
+            print "Manual inspection recommended regarding variables: \n\t", missingVariables
+
+    oldParams = calledFunc.getParameters()
+    if(len(paramlist1) != 0):
+        calledFunc.replaceParameters(paramlist1, FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
+
+    pylist = list()
+    for x in oldParams:
+        pylist.append(x)
+    paramlists[calledFunc.name] = pylist
+
+
+###def restore():
+###     fixing the calling convention (via 
+###                 cleanCallingConvention())
+###     requires modifying the decompiled results of the program.
+###     since we do not want to actually modify the original code,
+###     we restore the original parameter list after so that a
+###     user can confirm our results.
+
+def restore(func):
+    func.replaceParameters(paramlists[func.name], FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.DEFAULT)
+
+
+
+def cleanDecompilation(function):
+    global decomplists
+
+    bodyLines = doDecompile(function)
+    stackCanary = "__stack_chk_fail\(\);"
+    lineIdx = 0
+    while(lineIdx != -1):
+        lineIdx = -1
+        beforeIdx = -1
+        afterIdx = -1
+        for i in range(len(bodyLines)):
+            match = re.search(stackCanary, bodyLines[i])
+            if(match != None):
+                lineIdx = i
+                for j in range(lineIdx, -1, -1):
+                    if (re.search("{", bodyLines[j]) != None):
+                        beforeIdx = j
+                        break
+                for j in range(lineIdx, len(bodyLines)):
+                    if (re.search("}", bodyLines[j]) != None):
+                        afterIdx = j
+                        break
+                if(beforeIdx == -1 or afterIdx == -1):
+                    raise java.lang.AssertionError("stack canary found, but wrapped code block with unknown block separators")
+                bodyLines = bodyLines[0:beforeIdx] + bodyLines[afterIdx+1:]
+                ###note, this break is needed because
+                ###python only computes len(bodyLines) in the for
+                ###loop once, which means if we loop more after,
+                ###it guarantees an index out of bound exception
+                break
+    for i in range(len(bodyLines)-1,-1,-1):
+        if(re.search("in_FS_OFFSET + 0x28", bodyLines[i]) != None):
+            bodyLines = bodyLines[0:i] + bodyLines[i+1:]
+
+    decomplists[function.name] = bodyLines
+
+
+
+
+
+
+
+
+###def checkPaths():
+###     check to see where there is a valid path to store output 
+###     files to regardless of whether you use Windows or Unix
+###
+###@return True if the global variable PATH does point to a valid
+###     path in the file system or False otherwise. 
+###
+###@output: appends the current program's name to the PATH var,
+###     and then creates a directory for that program if it
+###     does not already exist.
+
+def checkPaths():
+    global PATH
+
+    PATH = WINPATH.replace("INSERTUSERNAME", getpass.getuser())
+    if(not os.path.exists(PATH)):
+        PATH = WINPATH.replace("INSERTUSERNAME", getpass.getuser()[:5])
+        if(not os.path.exists(PATH)):
+            PATH = UNIXPATH.replace("INSERTUSERNAME", getpass.getuser()[:5])
+            if(not os.path.exists(PATH)):
+                print("Please open this script and modify one of the two path variables (WINPATH or UNIXPATH) to provide a path to store your output.")
+                return False
+
+    if(not os.path.exists(PATH + getCurrentProgram().name)):
+        os.makedirs(PATH + getCurrentProgram().name)
+
+    PATH += getCurrentProgram().name + r"/"
+    return True
+
+
+###def main():
+###     1. make sure an output path exists
+###     2. find the real entry point function
+###     3. find all functions called by the user
+###     4. ignore any function that is external/not bound
+###         since ghidra doesn't have the code for that function
+###     5. fix the parameter lists for the user's functions
+###     6. remove dead/useless code
+###     7. restore the original code so a user can compare the two
+
+def main():
+    if(not checkPaths()):
+        return
+    print "*************Cleaning*************"
+    mainFunc = findEntry()
+    for x in mainFunc.getCalledFunctions(ConsoleTaskMonitor()):
+        if(not (x.isThunk() or x.getCallFixup() != None or x.isExternal())):
+            print("========\nexecuting clean on " + x.name)
+            ###first, fix param lists
+            cleanCallingConvention(x.name)
+            ###then fix decompilation
+            cleanDecompilation(x)
+
+    print("========\nexecuting clean on Main Method: " + mainFunc.name)
+    cleanDecompilation(mainFunc)
+    print "========\nClean Complete.\n\n"
+
+
+    print "*************Restoring*************"
+    print "Restoring Original Code:"
+    for x in mainFunc.getCalledFunctions(ConsoleTaskMonitor()):
+        if(not (x.isThunk() or x.getCallFixup() != None or x.isExternal())):
+            print("========\nrestoring " + x.name)
+            saveDecompilation(x, False)
+            restore(x)
+
+    
+    print("========\nrestoring " + mainFunc.name)
+    saveDecompilation(mainFunc, True)
+    print "========\nRestore Complete."
+
+
+
+program = getCurrentProgram()
+ifc = DecompInterface()
+ifc.openProgram(program)
+cp = state.currentProgram
+listing=cp.listing
+paramlists = dict()
+decomplists = dict()
+main()
